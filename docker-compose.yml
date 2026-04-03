@@ -1,0 +1,14 @@
+services:
+  plasma-svg-converter:
+    build: .
+    container_name: plasma-svg-converter
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    volumes:
+      - rembg-models:/root/.u2net
+    environment:
+      - PORT=5000
+
+volumes:
+  rembg-models:
