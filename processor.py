@@ -4,9 +4,7 @@ Image processing pipeline for CNC plasma cutting SVG generation.
 import cv2
 import numpy as np
 from PIL import Image
-import io
 import logging
-import math
 
 
 logger = logging.getLogger(__name__)
@@ -539,11 +537,11 @@ class ImageProcessor:
         # mismatch — any renderer will show the cut at true physical size.
         cut_paths_str = "\n    ".join(svg_paths)
         svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<!-- Plasma Cutting SVG  |  {svg_w_mm}mm × {svg_h_mm:.3f}mm -->
+<!-- Plasma Cutting SVG  |  {svg_w_mm:.3f}mm × {svg_h_mm:.3f}mm -->
 <!-- Outer contours: black  |  Holes: red (with bridge gaps) -->
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="{svg_w_mm}mm" height="{svg_h_mm:.3f}mm"
-     viewBox="0 0 {svg_w_mm} {svg_h_mm:.3f}">
+     width="{svg_w_mm:.3f}mm" height="{svg_h_mm:.3f}mm"
+     viewBox="0 0 {svg_w_mm:.3f} {svg_h_mm:.3f}">
   <defs>
     <style>
       .cut-path {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}
