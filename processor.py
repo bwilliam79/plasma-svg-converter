@@ -5,7 +5,11 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
+import logging
 import math
+
+
+logger = logging.getLogger(__name__)
 
 
 class ImageProcessor:
@@ -199,18 +203,22 @@ class ImageProcessor:
         Circular moving-average smooth of contour point coordinates.
         Removes pixel-level zigzag noise before simplification without
         changing the overall shape of the path.
+
+        Returns an (N, 1, 2) float32 array — we keep floats throughout the
+        geometry pipeline to avoid cumulative rounding error. Callers that
+        need integers should round at the very last step (path emission).
         """
         pts = contour.reshape(-1, 2).astype(float)
         n = len(pts)
         if n < window * 3:
-            return contour
+            return contour.astype(np.float32).reshape(-1, 1, 2)
         half = window // 2
         k = np.ones(window) / window
         px = np.concatenate([pts[-half:, 0], pts[:, 0], pts[:half, 0]])
         py = np.concatenate([pts[-half:, 1], pts[:, 1], pts[:half, 1]])
         sx = np.convolve(px, k, mode='valid')[:n]
         sy = np.convolve(py, k, mode='valid')[:n]
-        return np.column_stack([sx, sy]).reshape(-1, 1, 2).astype(np.int32)
+        return np.column_stack([sx, sy]).reshape(-1, 1, 2).astype(np.float32)
 
     def get_contours(self, mask: np.ndarray):
         """Return (contours, hierarchy) using RETR_CCOMP (two-level: outer + holes)."""
@@ -251,7 +259,14 @@ class ImageProcessor:
         close_dist = np.hypot(pts[0, 0] - pts[-1, 0], pts[0, 1] - pts[-1, 1])
         all_lens = np.append(seg_lens, close_dist)
         cum_len = np.concatenate([[0], np.cumsum(all_lens)])
-        total_len = cum_len[-1]
+        total_len = float(cum_len[-1])
+
+        # Degenerate contour (zero-length or NaN): no safe place to put a
+        # bridge, so emit the closed path untouched and skip bridge markers.
+        # Without this guard the `bc % total_len` calls below would raise or
+        # land on arbitrary points — bad news for a cut file.
+        if not np.isfinite(total_len) or total_len <= 0:
+            return self._pts_to_path(pts, close=True), []
 
         half_b = bridge_width_px / 2.0
 
@@ -309,12 +324,18 @@ class ImageProcessor:
     # ── SVG path helpers ───────────────────────────────────────────────────────
 
     def _pts_to_path(self, pts: np.ndarray, close: bool = True) -> str:
-        """Convert Nx2 array of points to SVG path data string."""
+        """Convert Nx2 array of points to SVG path data string.
+
+        Uses 3 decimal places of precision. At typical plasma cut scales
+        (paths emitted in mm) that's 1 um resolution — well below kerf
+        width and machine repeatability, and avoids the ~3 percent kerf
+        error that 1-decimal (0.1 mm) rounding introduces.
+        """
         if len(pts) < 2:
             return ""
-        d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f}"
+        d = f"M {pts[0][0]:.3f},{pts[0][1]:.3f}"
         for p in pts[1:]:
-            d += f" L {p[0]:.1f},{p[1]:.1f}"
+            d += f" L {p[0]:.3f},{p[1]:.3f}"
         if close:
             d += " Z"
         return d
@@ -389,6 +410,20 @@ class ImageProcessor:
                 (int(orig_w * scale), int(orig_h * scale)),
                 interpolation=cv2.INTER_AREA
             )
+            # Warn when we throw away significant spatial detail — precision
+            # of the resulting cut path is limited by whatever survives this
+            # downscale. A 50 percent (or greater) reduction is our threshold
+            # for "the user should know".
+            if scale < 0.5:
+                logger.warning(
+                    "Input %dx%d downscaled to %dx%d for processing "
+                    "(scale=%.3f). Path precision is reduced — consider "
+                    "supplying a smaller source image, or accept that fine "
+                    "detail below ~%.2fpx in the source will be lost.",
+                    orig_w, orig_h,
+                    int(orig_w * scale), int(orig_h * scale),
+                    scale, 1.0 / scale,
+                )
         else:
             proc_img = img
 
@@ -404,16 +439,24 @@ class ImageProcessor:
             raise ValueError("No subject detected — try adjusting the image or settings.")
 
         # ── Derived units ───────────────────────────────────────────────────
-        mm_per_px       = output_width_mm / orig_w          # mm per original pixel
-        svg_h_mm        = orig_h * mm_per_px
-        # Bridge width in original-resolution pixels, then scaled to proc-res
-        bridge_px_orig  = bridge_width_mm / mm_per_px
-        bridge_px_proc  = bridge_px_orig * scale
+        # We work in mm end-to-end for the path geometry: contours come out of
+        # OpenCV in proc-image pixels, we upscale them to original pixels (as
+        # floats — keeps the geometry in one coordinate system for both
+        # smoothing and simplification) and then convert to mm at emission.
+        # SVG width/height and viewBox both use mm, so there is no
+        # pixel-vs-mm mismatch in the output file.
+        inv_scale       = 1.0 / scale                        # proc-px -> orig-px
+        mm_per_orig_px  = output_width_mm / orig_w
+        svg_h_mm        = orig_h * mm_per_orig_px
+        svg_w_mm        = output_width_mm
+        # Bridge width in original-resolution pixels. Derived from the target
+        # physical size: bridge_mm * (orig_px / output_mm).
+        bridge_px_orig  = bridge_width_mm * orig_w / output_width_mm
         eps_factor      = simplification * 0.0006            # tuned for typical shapes
 
         # ── Build SVG paths ─────────────────────────────────────────────────
         svg_paths: list[str] = []
-        all_markers: list    = []
+        all_markers: list    = []          # in original-pixel coords
         hier = hierarchy[0]
 
         stats = {'outer': 0, 'holes': 0, 'bridges': 0}
@@ -428,25 +471,47 @@ class ImageProcessor:
             if is_hole and not keep_holes:
                 continue
 
-            # Smooth then simplify in proc-image space, then scale to original.
+            # Upscale proc-space contour to original-pixel space *before*
+            # smoothing and simplification. Running Douglas-Peucker at the
+            # same resolution we'll emit paths in (a) avoids the error
+            # amplification that dividing int32 coords by a sub-1 scale
+            # caused previously and (b) keeps bridge-length math in the
+            # same coordinate system as the contour itself.
+            contour_f = contour.astype(np.float32)
+            if scale != 1.0:
+                contour_f = contour_f * inv_scale
+
+            # Smooth then simplify at original resolution.
             # Smoothing removes pixel-level zigzag noise from the mask boundary;
             # apply a stronger window for hole contours which tend to be noisier.
-            smoothed   = self.smooth_contour(contour, window=9 if is_hole else 5)
+            smoothed   = self.smooth_contour(contour_f, window=9 if is_hole else 5)
             simplified = self.simplify_contour(smoothed, eps_factor)
-            if scale != 1.0:
-                simplified = (simplified.astype(float) * (1.0 / scale)).astype(np.int32)
+
+            # Flatten to (N, 2) floats and convert to mm for path emission.
+            pts_orig_px = simplified.reshape(-1, 2).astype(np.float32)
+            pts_mm      = pts_orig_px * mm_per_orig_px
 
             if is_hole:
-                path_d, markers = self.add_bridges(simplified, bridge_px_orig, num_bridges)
+                # Bridge width is in original pixels; convert to mm to match
+                # the coord system of the points we're about to splice.
+                bridge_mm = bridge_px_orig * mm_per_orig_px
+                path_d, markers_mm = self.add_bridges(
+                    pts_mm.reshape(-1, 1, 2), bridge_mm, num_bridges
+                )
                 if path_d:
                     svg_paths.append(
                         f'<path d="{path_d}" class="cut-path hole"/>'
                     )
-                    all_markers.extend(markers)
+                    # Track markers in original-pixel space for the preview
+                    # overlay (which is drawn on proc_img below).
+                    all_markers.extend(
+                        (mx / mm_per_orig_px, my / mm_per_orig_px)
+                        for mx, my in markers_mm
+                    )
                     stats['holes'] += 1
-                    stats['bridges'] += len(markers)
+                    stats['bridges'] += len(markers_mm)
             else:
-                path_d = self._pts_to_path(simplified.reshape(-1, 2), close=True)
+                path_d = self._pts_to_path(pts_mm, close=True)
                 if path_d:
                     svg_paths.append(
                         f'<path d="{path_d}" class="cut-path outer"/>'
@@ -457,24 +522,33 @@ class ImageProcessor:
             raise ValueError("No usable contours found after processing.")
 
         # ── Bridge marker circles (for preview overlay in SVG) ──────────────
+        # Markers are converted to mm to match the rest of the SVG coord
+        # system; radius 0.5mm is a visible dot without being huge.
         markers_svg = "\n    ".join(
-            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" class="bridge-dot"/>'
+            f'<circle cx="{x * mm_per_orig_px:.3f}" '
+            f'cy="{y * mm_per_orig_px:.3f}" r="0.5" class="bridge-dot"/>'
             for x, y in all_markers
         )
 
+        # Stroke width in mm: 0.2mm is visible in viewers but narrow enough
+        # that cutter pathing tools will read the midline reliably.
+        stroke_mm = 0.2
+
         # ── Assemble SVG ────────────────────────────────────────────────────
+        # width/height and viewBox are both in mm so there is no unit
+        # mismatch — any renderer will show the cut at true physical size.
         cut_paths_str = "\n    ".join(svg_paths)
         svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<!-- Plasma Cutting SVG  |  {output_width_mm}mm × {svg_h_mm:.1f}mm -->
+<!-- Plasma Cutting SVG  |  {svg_w_mm}mm × {svg_h_mm:.3f}mm -->
 <!-- Outer contours: black  |  Holes: red (with bridge gaps) -->
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="{output_width_mm}mm" height="{svg_h_mm:.1f}mm"
-     viewBox="0 0 {orig_w} {orig_h}">
+     width="{svg_w_mm}mm" height="{svg_h_mm:.3f}mm"
+     viewBox="0 0 {svg_w_mm} {svg_h_mm:.3f}">
   <defs>
     <style>
       .cut-path {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}
-      .outer    {{ stroke: #000000; stroke-width: 1.5; }}
-      .hole     {{ stroke: #cc0000; stroke-width: 1.5; }}
+      .outer    {{ stroke: #000000; stroke-width: {stroke_mm}; }}
+      .hole     {{ stroke: #cc0000; stroke-width: {stroke_mm}; }}
       .bridge-dot {{ fill: #00e5ff; opacity: 0.85; }}
     </style>
   </defs>
@@ -487,15 +561,19 @@ class ImageProcessor:
 </svg>'''
 
         # ── Build preview image ─────────────────────────────────────────────
-        preview_img = self.build_preview(proc_img, contours, hierarchy,
-                                         [(x * scale, y * scale) for x, y in all_markers])
+        # Preview is drawn on proc_img so markers (which we tracked in
+        # original-pixel coords) need to be scaled down to proc coords.
+        preview_img = self.build_preview(
+            proc_img, contours, hierarchy,
+            [(x * scale, y * scale) for x, y in all_markers],
+        )
 
         return {
             'svg': svg,
             'preview': preview_img,
             'stats': stats,
             'dimensions': {
-                'width_mm':  output_width_mm,
+                'width_mm':  svg_w_mm,
                 'height_mm': round(svg_h_mm, 1),
             }
         }

@@ -770,7 +770,16 @@
       detectedImg.style.display = activeTab === 'detected' ? 'block' : 'none';
       detectedLegend.style.display = activeTab === 'detected' ? 'flex' : 'none';
 
-      // Render SVG
+      // Render SVG.
+      //
+      // Security note: we trust `data.svg` because it was generated
+      // server-side by processor.py from numeric geometry values we
+      // produced — there is no user-supplied string that flows into the
+      // SVG unescaped. The /download endpoint re-parses SVGs with
+      // defusedxml before returning them as files, which covers the round
+      // trip back out. We deliberately do NOT try to re-sanitize in JS
+      // here — doing so would be both redundant and easy to get wrong;
+      // the server is the source of truth for SVG validity.
       currentSvg = data.svg;
       svgWrap.innerHTML = data.svg;
       const svgEl = svgWrap.querySelector('svg');
