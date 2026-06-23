@@ -1,7 +1,6 @@
 services:
-  plasma-svg-converter:
+  app:
     build: .
-    container_name: plasma-svg-converter
     restart: unless-stopped
     ports:
       - "5001:5000"
