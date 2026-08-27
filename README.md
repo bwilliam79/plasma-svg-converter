@@ -82,3 +82,15 @@ All parameters are configurable in the UI:
 - **Backend**: Python 3.11, Flask, OpenCV, rembg (AI background removal), NumPy, Pillow
 - **Frontend**: Vanilla JavaScript, HTML/CSS
 - **Deployment**: Docker Compose
+
+## PWA icons
+
+App icon is the locked plasma kerf-bear mark (`a-kerf-bear`). Pack in `static/` (Flask default static):
+
+- `favicon.ico` / `favicon-16.png` / `favicon-32.png`
+- `apple-touch-icon.png` (180)
+- `icon-192.png` / `icon-512.png` / `icon-maskable-512.png`
+- `manifest.json`
+
+Linked from `templates/index.html` as `/static/…?v=`.
+
